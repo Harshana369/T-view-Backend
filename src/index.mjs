@@ -7,13 +7,13 @@ import { fileURLToPath } from 'node:url';
 /**
  * මේක ඉතාම කුඩා server එකක් — npm dependency එකක්වත් නෑ, node එකෙන් කෙලින්ම දුවනවා.
  * වැඩ දෙකයි:
- *   1. /intx/* requests Coinbase INTX API එකට forward කරනවා
- *      (browser එකෙන් කෙලින්ම කරන්න බැරි නිසා — ඒ API එකේ CORS headers නෑ).
+ *   1. /fapi/* requests Binance USDT-M futures API එකට forward කරනවා
+ *      (browser එකෙන් කෙලින්ම call කරනවා වෙනුවට — CORS/region අවුල් මගහරින්න).
  *   2. build කරපු web app එක (apps2/web/dist) serve කරනවා.
  */
 
 const PORT = Number(process.env.PORT ?? 3002);
-const COINBASE = 'https://api.international.coinbase.com/api/v1';
+const BINANCE = 'https://fapi.binance.com';
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const WEB_DIST = resolve(HERE, '../../web/dist');
 
@@ -28,9 +28,9 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 
-/** /intx/xxx එකක් Coinbase API එකට යවලා, උත්තරේ එහෙම්මම browser එකට දෙනවා. */
-async function proxyToCoinbase(req, res, url) {
-  const target = `${COINBASE}${url.pathname.slice('/intx'.length)}${url.search}`;
+/** /fapi/xxx එකක් Binance API එකට යවලා, උත්තරේ එහෙම්මම browser එකට දෙනවා. */
+async function proxyToBinance(req, res, url) {
+  const target = `${BINANCE}${url.pathname}${url.search}`;
   try {
     const upstream = await fetch(target, { headers: { accept: 'application/json' } });
     const body = await upstream.text();
@@ -76,8 +76,8 @@ async function serveStatic(req, res, url) {
 
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-  if (url.pathname === '/intx' || url.pathname.startsWith('/intx/')) {
-    void proxyToCoinbase(req, res, url);
+  if (url.pathname === '/fapi' || url.pathname.startsWith('/fapi/')) {
+    void proxyToBinance(req, res, url);
   } else {
     void serveStatic(req, res, url);
   }
