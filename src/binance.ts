@@ -107,6 +107,25 @@ export async function proxyFapi(
 }
 
 /**
+ * Binance එකෙන් JSON එකක් ගෙනල්ලා Redis එකේ cache කරනවා. `/fapi/*` proxy
+ * එකේ raw passthrough එකට වඩා වෙනස් — මේකෙන් එන දේ server එකේම පාවිච්චි
+ * කරන්න පුළුවන් (scan.ts එකේ symbols list එකට වගේ).
+ */
+export async function cachedBinanceFetch<T>(
+  url: string,
+  cacheKey: string,
+  ttlSeconds: number,
+): Promise<T> {
+  const cached = await cacheGet(cacheKey);
+  if (cached !== null) return JSON.parse(cached) as T;
+  const res = await binanceFetch(url);
+  if (!res.ok) throw new Error(`${url} → ${res.status}`);
+  const data = (await res.json()) as T;
+  await cacheSet(cacheKey, JSON.stringify(data), ttlSeconds);
+  return data;
+}
+
+/**
  * `"0.0000123"` වගේ price string එකක තියෙන decimal ගණන. Binance හැම
  * price එකක්ම ඒ market එකේ tick size එකට pad කරලා දෙන නිසා, chart එකේ
  * price scale එකට ඕන precision එක මෙතනින් හරියටම ගන්න පුළුවන් — number

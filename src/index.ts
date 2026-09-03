@@ -7,6 +7,8 @@ import { BinanceRateLimitError, proxyFapi } from './binance.js';
 import { getCandles } from './candles.js';
 import { migrate } from './db.js';
 import { env } from './env.js';
+import { cacheGet, cacheSet } from './redis.js';
+import { scanBreakouts } from './scan.js';
 import { isInterval } from './types.js';
 
 /**
@@ -106,6 +108,73 @@ app.get<{ Querystring: KlinesQuery }>('/api/klines', async (req, reply) => {
     }
     return reply.code(502).send({ error: 'candles_failed', message: String(err) });
   }
+});
+
+// ------------------------------------------------------ breakout scan
+
+interface ScanQuery {
+  interval?: string;
+  length?: string;
+  atrPeriod?: string;
+  slMult?: string;
+  tp1?: string;
+  tp2?: string;
+  tp3?: string;
+  overlap?: string;
+  maxBarsAgo?: string;
+}
+
+const numberOr = (raw: string | undefined, fallback: number): number => {
+  const n = Number(raw ?? fallback);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+/** දැන් දුවන scans — එකම params වලට එකවර ආපු requests එකම sweep එකක් බෙදාගන්නවා. */
+const scansInFlight = new Map<string, Promise<string>>();
+
+/**
+ * Coins 500+ම Breakout Targets rule එකෙන් scan කරලා, Entry එකක් තියෙන
+ * ඒවා විතරක් දෙනවා. Browser එකෙන් coins එකින් එක open කරලා බලන්න ඕන නෑ.
+ */
+app.get<{ Querystring: ScanQuery }>('/api/scan/breakout', async (req, reply) => {
+  const interval = req.query.interval ?? '1h';
+  if (!isInterval(interval)) return reply.code(400).send({ error: 'invalid interval' });
+
+  const options = {
+    length: numberOr(req.query.length, 99),
+    preventOverlap: (req.query.overlap ?? 'On') === 'On',
+    atrPeriod: numberOr(req.query.atrPeriod, 14),
+    slMultiplier: numberOr(req.query.slMult, 5),
+    tp1Multiplier: numberOr(req.query.tp1, 0.5),
+    tp2Multiplier: numberOr(req.query.tp2, 1),
+    tp3Multiplier: numberOr(req.query.tp3, 1.5),
+  };
+
+  // "දැන් open වුණු" එකක් කියලා ගණන් ගන්නේ candles කීයක් ඇතුළතද.
+  const maxBarsAgo = Math.max(0, Math.min(numberOr(req.query.maxBarsAgo, 3), 100));
+
+  const key = `scan:breakout:${interval}:${maxBarsAgo}:${Object.values(options).join(':')}`;
+  const cached = await cacheGet(key);
+  if (cached !== null) {
+    return reply.header('x-cache', 'hit').type('application/json').send(cached);
+  }
+
+  // Sweep එකක් දුවනකොට තව එකක් පටන් ගන්නේ නෑ — පස්සේ ආපු අය දුවන එකට බලාගෙන ඉන්නවා.
+  let scan = scansInFlight.get(key);
+  if (!scan) {
+    scan = (async () => {
+      const result = await scanBreakouts(interval, options, maxBarsAgo);
+      const body = JSON.stringify(result);
+      // Entry එකක් හැදෙන්නේ candle එකක් close වුණාම විතරයි — ඒත් scanner
+      // එකට ඉක්මනට දැනගන්න ඕන නිසා TTL එක කෙටියි.
+      await cacheSet(key, body, 15);
+      return body;
+    })().finally(() => scansInFlight.delete(key));
+    scansInFlight.set(key, scan);
+  }
+
+  const body = await scan;
+  return reply.header('x-cache', 'miss').type('application/json').send(body);
 });
 
 // ------------------------------------------------------------ static web
