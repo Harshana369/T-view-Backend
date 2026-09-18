@@ -8,7 +8,7 @@ import { getCandles } from './candles.js';
 import { migrate } from './db.js';
 import { env } from './env.js';
 import { cacheGet, cacheSet } from './redis.js';
-import { scanBreakouts } from './scan.js';
+import { scanBreakouts, scanWinRate } from './scan.js';
 import { isInterval } from './types.js';
 
 /**
@@ -168,6 +168,77 @@ app.get<{ Querystring: ScanQuery }>('/api/scan/breakout', async (req, reply) => 
       // Entry එකක් හැදෙන්නේ candle එකක් close වුණාම විතරයි — ඒත් scanner
       // එකට ඉක්මනට දැනගන්න ඕන නිසා TTL එක කෙටියි.
       await cacheSet(key, body, 15);
+      return body;
+    })().finally(() => scansInFlight.delete(key));
+    scansInFlight.set(key, scan);
+  }
+
+  const body = await scan;
+  return reply.header('x-cache', 'miss').type('application/json').send(body);
+});
+
+// ----------------------------------------------- Bollinger + RSI win rate
+
+interface WinRateQuery {
+  interval?: string;
+  minWinRate?: string;
+  minTrades?: string;
+  rsiLength?: string;
+  bbLength?: string;
+  bbMult?: string;
+  initialSl?: string;
+  trailRatio?: string;
+  fee?: string;
+  slip?: string;
+}
+
+/**
+ * Coins ඔක්කොම Bollinger + RSI backtest එකෙන් දුවවලා, win rate එක
+ * දුන්න අගය පනින ඒවා දෙනවා. Watchlist group එකක් හදාගන්න.
+ */
+app.get<{ Querystring: WinRateQuery }>('/api/scan/winrate', async (req, reply) => {
+  const interval = req.query.interval ?? '15m';
+  if (!isInterval(interval)) return reply.code(400).send({ error: 'invalid interval' });
+
+  const minWinRate = Math.max(0, Math.min(numberOr(req.query.minWinRate, 75), 100));
+  const minTrades = Math.max(1, Math.min(numberOr(req.query.minTrades, 10), 1000));
+  const options = {
+    signal: {
+      rsiLength: numberOr(req.query.rsiLength, 6),
+      bbLength: numberOr(req.query.bbLength, 200),
+      bbMult: numberOr(req.query.bbMult, 2),
+    },
+    direction: 'both' as const,
+    atrLength: 14,
+    initialSlAtr: numberOr(req.query.initialSl, 2),
+    breakEvenAtR: 0,
+    breakEvenBufferR: 0.1,
+    trailAfterR: 0,
+    trailMode: 'ratio' as const,
+    trailRatio: numberOr(req.query.trailRatio, 0.5),
+    trailAtr: 2,
+    takeProfitR: 0,
+    exitOnOpposite: true,
+    feePct: numberOr(req.query.fee, 0.045),
+    slippagePct: numberOr(req.query.slip, 0.02),
+    maxRiskPct: 10,
+  };
+
+  const key = `scan:winrate:${interval}:${minWinRate}:${minTrades}:` +
+    `${Object.values(options.signal).join(':')}:${options.initialSlAtr}:` +
+    `${options.trailRatio}:${options.feePct}:${options.slippagePct}`;
+  const cached = await cacheGet(key);
+  if (cached !== null) {
+    return reply.header('x-cache', 'hit').type('application/json').send(cached);
+  }
+
+  let scan = scansInFlight.get(key);
+  if (!scan) {
+    scan = (async () => {
+      const result = await scanWinRate(interval, options, minWinRate, minTrades);
+      const body = JSON.stringify(result);
+      // Backtest එකක් — candle එකක් වහනකම් ප්‍රතිඵලය වෙනස් වෙන්නේ නෑ.
+      await cacheSet(key, body, 300);
       return body;
     })().finally(() => scansInFlight.delete(key));
     scansInFlight.set(key, scan);

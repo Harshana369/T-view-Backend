@@ -1,4 +1,5 @@
 import { cachedBinanceFetch } from './binance.js';
+import { computeBbRsiTrail, type BbRsiTrailOptions } from './bbRsiTrail.js';
 import { computeBreakoutTargets, type BreakoutOptions } from './breakoutTargets.js';
 import { getCandles } from './candles.js';
 import type { Interval } from './types.js';
@@ -19,6 +20,8 @@ import type { Interval } from './types.js';
 
 /** Box formation එකේ පදනම හොයන්න ඕන bars ගාණ (කෙටි window එකකට හසුවෙන්නේ නෑ). */
 const CANDLES = 900;
+/** Backtest scans වලට — trades කිහිපයක්වත් ලැබෙන්න bars ගොඩක් ඕන. */
+const BACKTEST_CANDLES = 3000;
 /** එකවර ගණන් හදන symbols ගාණ — DB reads විතරයි, ඒත් pool එක බර වැඩි කරන්නේ නෑ. */
 const CONCURRENCY = 12;
 
@@ -127,4 +130,87 @@ export async function scanBreakouts(
 
   hits.sort((a, b) => a.barsAgo - b.barsAgo || b.time - a.time); // අලුත්ම එක උඩම
   return { interval, scanned, hits, tookMs: Date.now() - startedAt };
+}
+
+// ------------------------------------------------- Bollinger + RSI win rate
+
+/** Coin එකක win rate එක. */
+export interface WinRateHit {
+  symbol: string;
+  /** TP/trail එකෙන් ලාභයක් ලැබුණු trades ප්‍රතිශතය. */
+  winRate: number;
+  trades: number;
+  /** ලාභ එකතුව ÷ පාඩු එකතුව. */
+  profitFactor: number;
+  /** Trade එකකට සාමාන්‍යය, R වලින් (fees + slippage ඇතුළත්ව). */
+  expectancy: number;
+}
+
+export interface WinRateScanResult {
+  interval: Interval;
+  /** පෙරහන පැනපු coins — winRate අනුව, වැඩිම එක මුලට. */
+  hits: WinRateHit[];
+  scanned: number;
+  minWinRate: number;
+  minTrades: number;
+  tookMs: number;
+}
+
+/**
+ * Coins ඔක්කොම Bollinger + RSI break-even/trail backtest එකෙන් දුවවලා,
+ * win rate එක `minWinRate` පනින ඒවා දෙනවා.
+ *
+ * ⚠️ Win rate එක **exit රීති වලින්** තීරණය වෙනවා — trail එක තද නම් ඒක
+ *    ලොකුයි, ඒත් දිනුම් පොඩියි. ඒ නිසා profit factor එකයි expectancy
+ *    එකයි දෙකත් එක්කම දෙනවා; win rate එක විතරක් බලලා තීරණයක් ගන්න එපා.
+ */
+export async function scanWinRate(
+  interval: Interval,
+  options: Omit<BbRsiTrailOptions, 'signal'> & { signal: BbRsiTrailOptions['signal'] },
+  minWinRate: number,
+  minTrades: number,
+): Promise<WinRateScanResult> {
+  const started = Date.now();
+  const symbols = await fetchScanSymbols();
+  const hits: WinRateHit[] = [];
+  // ⚠️ Breakout scan එකේ 900 මෙතනට මදි — bbLength 200 ක warmup එකට
+  //    පස්සේ trades කිහිපයක්වත් නෑ. Backtest එකකට bars ගොඩක් ඕන.
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    for (;;) {
+      const index = cursor++;
+      if (index >= symbols.length) return;
+      const symbol = symbols[index];
+      try {
+        const { candles } = await getCandles(symbol, interval, BACKTEST_CANDLES);
+        if (candles.length < 600) continue;
+        const r = computeBbRsiTrail(candles, options);
+        const st = r.stats;
+        if (st.trades < minTrades) continue;
+        if (st.winRate < minWinRate) continue;
+        hits.push({
+          symbol,
+          winRate: st.winRate,
+          trades: st.trades,
+          profitFactor: Number.isFinite(st.profitFactor) ? st.profitFactor : 999,
+          expectancy: st.expectancy,
+        });
+      } catch {
+        // Coin එකක් අසාර්ථක වුණාට sweep එක නවත්තන්නේ නෑ.
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  hits.sort((a, b) => b.winRate - a.winRate);
+
+  return {
+    interval,
+    hits,
+    scanned: symbols.length,
+    minWinRate,
+    minTrades,
+    tookMs: Date.now() - started,
+  };
 }
