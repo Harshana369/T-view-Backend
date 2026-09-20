@@ -188,6 +188,9 @@ interface WinRateQuery {
   bbMult?: string;
   initialSl?: string;
   trailRatio?: string;
+  trailAfter?: string;
+  minLock?: string;
+  exitBand?: string;
   fee?: string;
   slip?: string;
 }
@@ -213,12 +216,15 @@ app.get<{ Querystring: WinRateQuery }>('/api/scan/winrate', async (req, reply) =
     initialSlAtr: numberOr(req.query.initialSl, 2),
     breakEvenAtR: 0,
     breakEvenBufferR: 0.1,
-    trailAfterR: 0,
+    // Chart එකේ defaults එක්කම — SL එක entry එක ළඟ ඇලෙන්නේ නෑ.
+    trailAfterR: numberOr(req.query.trailAfter, 0.5),
     trailMode: 'ratio' as const,
-    trailRatio: numberOr(req.query.trailRatio, 0.5),
+    trailRatio: numberOr(req.query.trailRatio, 0.7),
     trailAtr: 2,
+    minLockR: numberOr(req.query.minLock, 0.5),
     takeProfitR: 0,
     exitOnOpposite: true,
+    exitOnBand: req.query.exitBand !== '0',
     feePct: numberOr(req.query.fee, 0.045),
     slippagePct: numberOr(req.query.slip, 0.02),
     maxRiskPct: 10,
@@ -226,7 +232,9 @@ app.get<{ Querystring: WinRateQuery }>('/api/scan/winrate', async (req, reply) =
 
   const key = `scan:winrate:${interval}:${minWinRate}:${minTrades}:` +
     `${Object.values(options.signal).join(':')}:${options.initialSlAtr}:` +
-    `${options.trailRatio}:${options.feePct}:${options.slippagePct}`;
+    `${options.trailRatio}:${options.trailAfterR}:${options.minLockR}:` +
+    `${options.exitOnBand}:` +
+    `${options.feePct}:${options.slippagePct}`;
   const cached = await cacheGet(key);
   if (cached !== null) {
     return reply.header('x-cache', 'hit').type('application/json').send(cached);

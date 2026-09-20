@@ -30,6 +30,7 @@ export type BbExitReason =
   | 'stop'       // මුල් SL එක — පාඩුවක්
   | 'breakeven'  // BE එකට ගෙනාපු SL එක — පාඩුවක් නෑ
   | 'trail'      // trail වෙච්ච SL එක — ලාභයක්
+  | 'band'       // අනිත් පැත්තේ BB line එක — ඉලක්කයට ආවා
   | 'target'
   | 'opposite'
   | 'open';
@@ -60,6 +61,31 @@ export interface BbRsiTrailOptions {
   trailRatio: number;
   /** `atr` mode එකට — trail දුර (×ATR). 0 = trail නෑ. */
   trailAtr: number;
+  /**
+   * Trail පටන් ගත්තාට පස්සේ **අවම වශයෙන්** අගුළු දාන ලාභය (R).
+   *
+   * මේක නැත්නම් SL එක entry එක ළඟින්ම නතර වෙනවා: ratio 0.5 එකේදී
+   * හොඳම ලාභය +0.12R නම් අගුළු වෙන්නේ +0.06R ක් විතරයි — ඒකෙන් වැඩක් නෑ.
+   * `minLockR = 0.5` දැම්මොත් trail පටන් ගත්ත ගමන් SL එක අඩුම තරමේ
+   * +0.5R කට යනවා, ඒ නිසා trade එක හැරුණත් **සැලකිය යුතු ලාභයක්**
+   * ලැබෙනවා.
+   *
+   * ⚠️ ලබාගත්තු ලාභයට වඩා අගුළු දාන්න බෑ — ඒ නිසා `min(minLockR, best)`.
+   */
+  minLockR: number;
+  /**
+   * SL එක **trail වෙන්න පටන් අරගෙන** තියෙද්දී මිල අනිත් පැත්තේ
+   * Bollinger line එකට ආවොත් එතනින්ම trade එක වහනවා.
+   *
+   *   SHORT  →  BB **lower** line එක (මිල බහිනවා = අපේ ලාභය)
+   *   LONG   →  BB **upper** line එක (මිල නඟිනවා = අපේ ලාභය)
+   *
+   * හේතුව: මේක mean-reversion strategy එකක්. Band එකට ආවම චලනය
+   * ඉවරයි — එතනින් එහාට trail එකට බලාගෙන ඉන්නවා කියන්නේ ලාභය ආපහු
+   * දෙන එක. `startedTrailing` කොන්දේසිය නිසා ලාභයක් අගුළු වෙලා
+   * නැත්නම් මේක ක්‍රියාත්මක වෙන්නේ නෑ.
+   */
+  exitOnBand: boolean;
   /** ස්ථිර take profit (R). 0 = නෑ. */
   takeProfitR: number;
   exitOnOpposite: boolean;
@@ -85,10 +111,16 @@ export const BB_TRAIL_DEFAULTS: Omit<BbRsiTrailOptions, 'signal'> = {
   // වුණාම SL එක entry එකට එහා), ඒ නිසා වෙනම BE පියවරක් ඕන නෑ.
   breakEvenAtR: 0,
   breakEvenBufferR: 0.1,
-  trailAfterR: 0,
+  // coins 78ක්, 15m, trades 27,000+ මැනලා තෝරගත්ත අගයන්:
+  //   after 0.5 + lock 0.5 + ratio 0.7  →  avg lock 0.505R,
+  //   +1R ට ගිහින් හැරුණු trades වල සාමාන්‍ය ප්‍රතිඵලය +0.90R.
+  // (කලින් තිබුණු after 0 + lock 0 එකේ avg lock 0.007R — නිකරුණේ.)
+  trailAfterR: 0.5,
   trailMode: 'ratio',
-  trailRatio: 0.5,
+  trailRatio: 0.7,
   trailAtr: 2,
+  minLockR: 0.5,
+  exitOnBand: true,
   takeProfitR: 0,
   exitOnOpposite: true,
   feePct: 0.045,
@@ -154,7 +186,7 @@ function emptyStats(): BbTrailStats {
   return {
     trades: 0, wins: 0, winRate: 0, expectancy: 0, totalR: 0,
     profitFactor: 0, maxDrawdownR: 0, avgWinR: 0, avgLossR: 0,
-    byReason: { stop: 0, breakeven: 0, trail: 0, target: 0, opposite: 0, open: 0 },
+    byReason: { stop: 0, breakeven: 0, trail: 0, band: 0, target: 0, opposite: 0, open: 0 },
     savedByBreakEven: 0, captureRatio: 0,
   };
 }
@@ -198,6 +230,7 @@ function summarise(trades: BbTrade[]): BbTrailStats {
 function runTrade(
   candles: Candle[],
   atr: number[],
+  bands: { upper: number[]; lower: number[] },
   i: number,
   dir: 1 | -1,
   o: BbRsiTrailOptions,
@@ -275,14 +308,25 @@ function runTrade(
       // `ratio`: හොඳම ලාභයෙන් `trailRatio` ක් අගුළු දානවා.
       //          (1:2 → best +2R වුණාම SL එක +1R ට.)
       // `atr`  : හොඳම **මිලෙන්** ATR කිහිපයක් පිටිපස්සෙන්.
-      const candidate =
+      let lockR =
         o.trailMode === 'ratio'
-          ? entry + dir * risk * (best * o.trailRatio)
+          ? best * o.trailRatio
           : (() => {
               const at = atr[j] > 0 ? atr[j] : a;
-              return dir === 1 ? b.high - at * o.trailAtr : b.low + at * o.trailAtr;
+              const px = dir === 1 ? b.high - at * o.trailAtr : b.low + at * o.trailAtr;
+              return ((px - entry) * dir) / risk;
             })();
-      if (dir === 1 ? candidate > stop : candidate < stop) {
+
+      // අවම අගුළු — ඒත් ලබාගත්තු ලාභයට වඩා අගුළු දාන්න බෑ.
+      if (o.minLockR > 0) lockR = Math.max(lockR, Math.min(o.minLockR, best));
+
+      const candidate = entry + dir * risk * lockR;
+      // SL එක දැන් තියෙන මිල පනින්නේ නෑ. එහෙම තැනක් ආවොත් (මිල ආපහු
+      // හැරිලා) SL එක **තිබුණු තැනම** තියනවා — මිලට ඇලවුනු SL එකක්
+      // ඊළඟ bar එකේම වැදිලා trade එක නිකරුණේ කපනවා.
+      const placeable = dir === 1 ? candidate <= b.close : candidate >= b.close;
+
+      if (placeable && (dir === 1 ? candidate > stop : candidate < stop)) {
         stop = candidate;
         if (!startedTrailing) trailStartIndex = j;
         startedTrailing = true;
@@ -290,7 +334,20 @@ function runTrade(
       }
     }
 
-    // 5. විරුද්ධ signal එකක්
+    // 5. අනිත් පැත්තේ BB line එක — ලාභයක් අගුළු වෙලා තියෙද්දී විතරයි.
+    //    ⚠️ මේ bar එකේම trail පටන් ගත්තා නම් මේක බලන්නේ නෑ. Bar එකක්
+    //    ඇතුළේ මොකක් මුලින් වුණාද කියලා candle එකකින් දැනගන්න බෑ, ඒ
+    //    නිසා trail එක **කලින් bar එකක** පටන් ගත්තා නම් විතරයි වහන්නේ.
+    if (o.exitOnBand && trailStartIndex >= 0 && trailStartIndex < j) {
+      const band = dir === 1 ? bands.upper[j] : bands.lower[j];
+      if (!Number.isNaN(band) && (dir === 1 ? b.high >= band : b.low <= band)) {
+        // Band එකේ limit order එකක් — ඒ මිලට fill වෙනවා. Bar එක ඒක
+        // පනිනවා නම් ඒකෙන් අපිට වාසියක් මිසක් අවාසියක් නෑ.
+        return finish(j, band, 'band');
+      }
+    }
+
+    // 6. විරුද්ධ signal එකක්
     if (o.exitOnOpposite && opposite.has(j)) return finish(j, b.close, 'opposite');
   }
 
@@ -301,6 +358,7 @@ function runTrade(
 function runAll(
   candles: Candle[],
   atr: number[],
+  bands: { upper: number[]; lower: number[] },
   signals: { index: number; dir: 1 | -1 }[],
   o: BbRsiTrailOptions,
 ): BbTrade[] {
@@ -309,7 +367,7 @@ function runAll(
   for (const s of signals) {
     if (s.index <= busyUntil) continue;
     const opposite = new Set(signals.filter((x) => x.dir !== s.dir).map((x) => x.index));
-    const t = runTrade(candles, atr, s.index, s.dir, o, opposite);
+    const t = runTrade(candles, atr, bands, s.index, s.dir, o, opposite);
     if (!t) continue;
     trades.push(t);
     busyUntil = t.exitIndex;
@@ -332,13 +390,17 @@ export function computeBbRsiTrail(candles: Candle[], o: BbRsiTrailOptions): BbTr
     )
     .map((s) => ({ index: s.index, dir: s.dir }));
   const atr = atrArray(candles, o.atrLength);
+  const bands = { upper: base.upper, lower: base.lower };
 
-  const trades = runAll(candles, atr, signals, o);
+  const trades = runAll(candles, atr, bands, signals, o);
 
   // Break-even එකෙන් ඇත්තටම වෙනසක් වෙනවද — ඒක මනින්න.
   const variants: { name: string; opts: Partial<BbRsiTrailOptions> }[] = [
     { name: 'Current settings', opts: {} },
-    { name: 'Ratio 1:2 (lock half)', opts: { trailMode: 'ratio', trailRatio: 0.5, breakEvenAtR: 0, trailAfterR: 0 } },
+    { name: 'Lock 0.5R min (default)', opts: { trailMode: 'ratio', trailRatio: 0.7, breakEvenAtR: 0, trailAfterR: 0.5, minLockR: 0.5 } },
+    { name: 'Lock 1.0R min (wider gap)', opts: { trailMode: 'ratio', trailRatio: 0.7, breakEvenAtR: 0, trailAfterR: 1, minLockR: 1 } },
+    { name: 'No BB band exit', opts: { exitOnBand: false } },
+    { name: 'No min lock (SL hugs entry)', opts: { trailMode: 'ratio', trailRatio: 0.5, breakEvenAtR: 0, trailAfterR: 0, minLockR: 0 } },
     { name: 'Ratio 1:3 (lock third)', opts: { trailMode: 'ratio', trailRatio: 1 / 3, breakEvenAtR: 0, trailAfterR: 0 } },
     { name: 'Ratio 2:3 (lock two thirds)', opts: { trailMode: 'ratio', trailRatio: 2 / 3, breakEvenAtR: 0, trailAfterR: 0 } },
     { name: 'ATR trail 2x + BE', opts: { trailMode: 'atr', trailAtr: 2, breakEvenAtR: 1, trailAfterR: 1.5 } },
@@ -346,7 +408,7 @@ export function computeBbRsiTrail(candles: Candle[], o: BbRsiTrailOptions): BbTr
   ];
   const comparison = variants.map((v) => ({
     name: v.name,
-    stats: summarise(runAll(candles, atr, signals, { ...o, ...v.opts })),
+    stats: summarise(runAll(candles, atr, bands, signals, { ...o, ...v.opts })),
   }));
 
   return {
