@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
+import fastifyWebsocket from '@fastify/websocket';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { BinanceRateLimitError, proxyFapi } from './binance.js';
 import { getCandles } from './candles.js';
@@ -9,6 +10,7 @@ import { migrate } from './db.js';
 import { env } from './env.js';
 import { cacheGet, cacheSet } from './redis.js';
 import { scanBreakouts, scanWinRate } from './scan.js';
+import { stream } from './stream.js';
 import { isInterval } from './types.js';
 
 /**
@@ -33,7 +35,76 @@ const app = Fastify({ logger: true });
 // එකක ඉඳන් call කරන්න ඕන වුණොත් permissive default එකක් තියාගන්නවා.
 await app.register(cors, { origin: true });
 
-app.get('/api/health', async () => ({ ok: true }));
+await app.register(fastifyWebsocket);
+
+app.get('/api/health', async () => ({ ok: true, stream: stream.status() }));
+
+/**
+ * Live data — REST polling එකට වෙනුවට.
+ *
+ * Browser එක මේකට connect වෙලා ඕන දේ ඉල්ලනවා:
+ *   {"op":"sub","ch":"tickers"}
+ *   {"op":"sub","ch":"kline","symbol":"BTCUSDT","interval":"15m"}
+ *   {"op":"unsub", ...}
+ *
+ * Browser කීයක් තිබ්බත් Binance එකට යන්නේ එක connection එකයි — ඒ නිසා
+ * මෙතනින් REST weight **බිංදුවයි**.
+ */
+app.get('/ws', { websocket: true }, (socket) => {
+  let wantTickers = false;
+  /** `SYMBOL|interval` → unsubscribe. */
+  const klines = new Map<string, () => void>();
+
+  const send = (payload: unknown) => {
+    if (socket.readyState === 1) socket.send(JSON.stringify(payload));
+  };
+
+  const off = stream.on((event) => {
+    if (event.type === 'tickers') {
+      if (wantTickers) send(event);
+      return;
+    }
+    // Chart එකක් ඉල්ලුවේ නැති symbol/interval එකක් යවන්නේ නෑ.
+    if (klines.has(`${event.symbol}|${event.interval}`)) send(event);
+  });
+
+  socket.on('message', (raw: Buffer) => {
+    let msg: { op?: string; ch?: string; symbol?: string; interval?: string };
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.ch === 'tickers') {
+      wantTickers = msg.op === 'sub';
+      // Connect වෙච්ච ගමන් දැනට තියෙන මිල — ඊළඟ push එක එනකම් බලාගෙන
+      // ඉන්න ඕන නෑ.
+      if (wantTickers) {
+        const snap = stream.snapshot();
+        if (snap.length > 0) send({ type: 'tickers', data: snap });
+      }
+      return;
+    }
+
+    if (msg.ch === 'kline' && msg.symbol && msg.interval) {
+      const key = `${msg.symbol.toUpperCase()}|${msg.interval}`;
+      if (msg.op === 'sub') {
+        if (klines.has(key)) return;
+        klines.set(key, stream.subscribeKline(msg.symbol, msg.interval as never));
+      } else {
+        klines.get(key)?.();
+        klines.delete(key);
+      }
+    }
+  });
+
+  socket.on('close', () => {
+    off();
+    for (const release of klines.values()) release();
+    klines.clear();
+  });
+});
 
 async function handleFapi(req: FastifyRequest, reply: FastifyReply) {
   const url = new URL(req.url, 'http://internal');
@@ -272,4 +343,8 @@ if (existsSync(webDist)) {
 }
 
 await migrate();
+// Binance WS එක app එක පටන් ගත්ත ගමන් — ticker snapshot එක client
+// කෙනෙක් එනකම් බලාගෙන ඉන්නේ නෑ, එතකොට පළමු client එකටත් වහාම දෙන්න
+// පුළුවන්.
+stream.start();
 await app.listen({ port: env.port, host: '127.0.0.1' });
